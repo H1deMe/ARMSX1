@@ -69,6 +69,7 @@ jobs:
           spec_path = Path('ios/HostApp/project.yml')
           spec = yaml.safe_load(spec_path.read_text())
           target = spec['targets']['ARMSX']
+          target['dependencies'].append({'sdk': 'UniformTypeIdentifiers.framework'})
           target.pop('resources', None)
           target['sources'] = [
               {'path': 'Sources'},
