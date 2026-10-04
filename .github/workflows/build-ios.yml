@@ -1,0 +1,168 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-ios.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      IOS_DEPLOYMENT_TARGET: "15.1"
+      BUILD_JOBS: "3"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out native dependencies
+        run: git submodule update --init --recursive --depth 1 third_party/fuse-lib third_party/libchdr
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install 'cmake==3.31.6' 'jinja2==3.1.6' 'PyYAML==6.0.2'
+          brew install xcodegen
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Prepare iOS build settings and resources
+        run: |
+          python - <<'PY'
+          import json
+          import plistlib
+          import subprocess
+          from pathlib import Path
+          import yaml
+
+          # The upstream iOS path builds desktop GL by default. iOS needs GLES.
+          build = Path('build.sh')
+          text = build.read_text()
+          anchor = '        -DCMAKE_SYSTEM_NAME=iOS \\\n'
+          if text.count(anchor) != 1:
+              raise SystemExit('Upstream iOS CMake block changed; review build.sh.')
+          text = text.replace(anchor,
+              '        -DFSUI_IMGUI_OPENGL_ES3=ON \\\n'
+              '        -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \\\n' + anchor)
+          build.write_text(text)
+
+          # Bitcode is obsolete on current Xcode toolchains.
+          makefile = Path('Makefile')
+          makefile.write_text(makefile.read_text().replace(' -fembed-bitcode', ''))
+
+          # Regenerate a shared scheme and embed the real runtime resources.
+          spec_path = Path('ios/HostApp/project.yml')
+          spec = yaml.safe_load(spec_path.read_text())
+          target = spec['targets']['ARMSX']
+          target.pop('resources', None)
+          target['sources'] = [
+              {'path': 'Sources'},
+              {'path': 'Assets.xcassets', 'buildPhase': 'resources'},
+              {'path': 'PrivacyInfo.xcprivacy', 'buildPhase': 'resources'},
+              {'path': '../../icons', 'type': 'folder', 'buildPhase': 'resources'},
+          ]
+          target['settings'].update({
+              'CLANG_CXX_LANGUAGE_STANDARD': 'c++20',
+              'CODE_SIGNING_ALLOWED': 'NO',
+              'CODE_SIGNING_REQUIRED': 'NO',
+              'TARGETED_DEVICE_FAMILY': '1,2',
+          })
+          spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+
+          plist_path = Path('ios/HostApp/Sources/Info.plist')
+          with plist_path.open('rb') as f:
+              info = plistlib.load(f)
+          info['UISupportedInterfaceOrientations'] = [
+              'UIInterfaceOrientationLandscapeLeft',
+              'UIInterfaceOrientationLandscapeRight',
+          ]
+          with plist_path.open('wb') as f:
+              plistlib.dump(info, f)
+
+          catalog = Path('ios/HostApp/Assets.xcassets')
+          appicon = catalog / 'AppIcon.appiconset'
+          appicon.mkdir(parents=True, exist_ok=True)
+          metadata = {'version': 1, 'author': 'xcode'}
+          (catalog / 'Contents.json').write_text(json.dumps({'info': metadata}))
+          images = []
+          slots = [
+              ('iphone', [20, 29, 40, 60], [2, 3]),
+              ('ipad', [20, 29, 40, 76], [1, 2]),
+              ('ipad', [83.5], [2]),
+              ('ios-marketing', [1024], [1]),
+          ]
+          for idiom, sizes, scales in slots:
+              for size in sizes:
+                  for scale in scales:
+                      pixels = int(size * scale)
+                      filename = f'icon-{pixels}.png'
+                      image_path = appicon / filename
+                      if not image_path.exists():
+                          subprocess.run(['sips', '-z', str(pixels), str(pixels),
+                              'icons/ArmsxDesktop.png', '--out', str(image_path)], check=True)
+                      images.append({'idiom': idiom, 'size': f'{size}x{size}',
+                          'scale': f'{scale}x', 'filename': filename})
+          (appicon / 'Contents.json').write_text(json.dumps({'images': images, 'info': metadata}))
+          PY
+
+      - name: Build native iOS runtime
+        run: |
+          export FSUI_PYTHON_EXECUTABLE="$(command -v python)"
+          sh build.sh ios
+          xcrun lipo -verify_arch arm64 ios/Frameworks/libarmsx.dylib
+          xcrun otool -L ios/Frameworks/libarmsx.dylib
+
+      - name: Build iPhone and iPad app
+        run: |
+          xcodegen generate --spec ios/HostApp/project.yml
+          xcodebuild \
+            -project ios/HostApp/ARMSX.xcodeproj \
+            -scheme ARMSX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios-app \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            build
+
+      - name: Package and verify IPA
+        run: |
+          app=build/ios-app/Build/Products/Release-iphoneos/ARMSX.app
+          test -s "$app/ARMSX"
+          test -s "$app/Frameworks/libarmsx.dylib"
+          test -s "$app/Frameworks/SDL2.framework/SDL2"
+          test -s "$app/PrivacyInfo.xcprivacy"
+          test -s "$app/icons/FsuiAppIcon.png"
+          xcrun lipo -verify_arch arm64 "$app/ARMSX"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
+          mkdir -p build/ios-package/Payload dist
+          cp -R "$app" build/ios-package/Payload/
+          (cd build/ios-package && zip -qry ../../dist/ARMSX1-ios-arm64-unsigned.ipa Payload)
+          unzip -t dist/ARMSX1-ios-arm64-unsigned.ipa
+          shasum -a 256 dist/ARMSX1-ios-arm64-unsigned.ipa > dist/SHA256SUMS.txt
+          git rev-parse HEAD > dist/SOURCE_COMMIT.txt
+          printf 'Unsigned iOS arm64 build; iOS 15.1+. Re-sign before installing.\n' > dist/README.txt
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX1-iOS-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
