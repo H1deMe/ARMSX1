@@ -124,7 +124,7 @@ jobs:
         run: |
           export FSUI_PYTHON_EXECUTABLE="$(command -v python)"
           sh build.sh ios
-          xcrun lipo -verify_arch arm64 ios/Frameworks/libarmsx.dylib
+          xcrun lipo ios/Frameworks/libarmsx.dylib -verify_arch arm64
           xcrun otool -L ios/Frameworks/libarmsx.dylib
 
       - name: Build iPhone and iPad app
@@ -148,7 +148,7 @@ jobs:
           test -s "$app/Frameworks/SDL2.framework/SDL2"
           test -s "$app/PrivacyInfo.xcprivacy"
           test -s "$app/icons/FsuiAppIcon.png"
-          xcrun lipo -verify_arch arm64 "$app/ARMSX"
+          xcrun lipo "$app/ARMSX" -verify_arch arm64
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
           mkdir -p build/ios-package/Payload dist
           cp -R "$app" build/ios-package/Payload/
